@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Code Surgeon (HTML)</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --text:#c9d1d9; --muted:#8b949e; --accent:#58a6ff; --ok:#2ea043; --warn:#d29922; --bad:#f85149; --mono: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family: Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }
+  header { padding:16px 20px; border-bottom:1px solid #30363d; }
+  header h1 { margin:0; font-size:18px; letter-spacing:.2px; }
+  main { padding:16px; display:grid; gap:12px; grid-template-columns: 1fr 1fr; }
+  .panel { background:var(--panel); border:1px solid #30363d; border-radius:12px; padding:12px; }
+  .panel h2 { margin:0 0 8px; font-size:14px; color:var(--muted); }
+  label { display:block; margin:8px 0 4px; font-size:12px; color:var(--muted); }
+  input[type="text"], textarea, select { width:100%; box-sizing:border-box; background:#0b0f14; border:1px solid #30363d; color:var(--text); border-radius:8px; padding:8px; font-family: var(--mono); font-size:12px; }
+  textarea { min-height:180px; resize:vertical; }
+  .row { display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
+  .controls { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; align-items:center; }
+  button { background:#21262d; border:1px solid #30363d; color:var(--text); padding:8px 10px; border-radius:8px; cursor:pointer; font-size:12px; }
+  button.primary { background:var(--accent); color:#001b36; border-color:#1f6feb; }
+  button.good { background:var(--ok); color:#001b36; border-color:#1f6f3d; }
+  button:hover { filter:brightness(1.05); }
+  .hint { font-size:12px; color:var(--muted); }
+  .status { font-size:12px; margin-top:6px; }
+  .status strong { color:var(--accent); }
+  pre { margin:6px 0 0; padding:8px; background:#0b0f14; border:1px solid #30363d; border-radius:8px; max-height:320px; overflow:auto; }
+  code { font-family: var(--mono); font-size:12px; white-space:pre; }
+  .grid-3 { display:grid; grid-template-columns: 1fr 1fr 1fr; gap:12px; }
+  @media (max-width: 1100px) {
+    main { grid-template-columns: 1fr; }
+    .row, .grid-3 { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+  <header>
+    <h1>🪡 Code Surgeon — fuzzy insert & comment-out</h1>
+  </header>
+
+  <main>
+    <section class="panel">
+      <h2>Inputs</h2>
+      <div class="row">
+        <div>
+          <label for="filename">Filename (for extension + download)</label>
+          <input id="filename" type="text" placeholder="e.g. app.py or server.js" />
+        </div>
+        <div>
+          <label for="commentStyle">Comment style (auto from extension, or override)</label>
+          <select id="commentStyle">
+            <option value="auto" selected>Auto (from filename)</option>
+            <option value="hash"># (Python, Shell, YAML)</option>
+            <option value="slash">// (JS/TS/C/CPP/Java)</option>
+            <option value="dash">-- (Lua)</option>
+          </select>
+        </div>
+      </div>
+
+      <label for="base">Base code</label>
+      <textarea id="base" spellcheck="false" placeholder="Paste your original file here..."></textarea>
+
+      <div class="grid-3">
+        <div>
+          <label for="target">Target snippet (approximate)</label>
+          <textarea id="target" spellcheck="false" placeholder="Paste the old code (or part of it) you want to replace..."></textarea>
+        </div>
+        <div>
+          <label for="insertion">New code (replacement)</label>
+          <textarea id="insertion" spellcheck="false" placeholder="Paste the new code to insert..."></textarea>
+        </div>
+        <div>
+          <label for="threshold">Fuzzy threshold (0.00–1.00)</label>
+          <input id="threshold" type="text" value="0.55" />
+          <div class="hint">We use token bigram Dice similarity on a sliding window.</div>
+          <label for="wiggle">Line wiggle (± around target length)</label>
+          <input id="wiggle" type="text" value="2" />
+          <div class="hint">How many lines around the target snippet length to consider.</div>
+        </div>
+      </div>
+
+      <div class="controls">
+        <button id="findBtn">Find Match</button>
+        <button id="applyBtn" class="primary">Apply Patch</button>
+        <button id="downloadBtn" class="good">Download .x version</button>
+        <span class="hint">Tip: keep “word wrap” OFF when copying code to avoid pasted strings breaking.</span>
+      </div>
+
+      <div class="status" id="status">Ready.</div>
+    </section>
+
+    <section class="panel">
+      <h2>Preview</h2>
+      <div id="previewMeta" class="hint">No match yet.</div>
+      <pre><code id="preview"></code></pre>
+    </section>
+  </main>
+
+<script>
+/* ===== Helpers ===== */
+
+const byId = id => document.getElementById(id);
+
+function normalizeNewlines(s) { return s.replace(/\r\n/g, '\n').replace(/\r/g, '\n'); }
+function leadingIndentOf(line) { const m = line.match(/^[ \t]*/); return m ? m[0] : ""; }
+
+function getCommentPrefix(filename, override) {
+  if (override && override !== 'auto') {
+    if (override === 'hash')  return '#';
+    if (override === 'slash') return '//';
+    if (override === 'dash')  return '--';
+  }
+  const ext = (filename || "").toLowerCase().split('.').pop();
+  if (['py','sh','rb','yml','yaml','toml','ini','cfg','ps1'].includes(ext)) return '#';
+  if (['js','ts','jsx','tsx','c','cc','cpp','h','hpp','java','cs','go','rs','php','swift','kt','m','mm'].includes(ext)) return '//';
+  if (['lua'].includes(ext)) return '--';
+  return '#';
+}
+
+function bigrams(str) {
+  const s = str;
+  const grams = [];
+  for (let i = 0; i < s.length - 1; i++) grams.push(s.slice(i, i+2));
+  return grams;
+}
+
+function tokenize(code) {
+  // keep codey characters, collapse whitespace
+  return code.replace(/[^\w\s{}()[\].,:;'"`<>=+\-*/%!&#|^~]/g, ' ')
+             .replace(/\s+/g, ' ')
+             .trim();
+}
+
+function diceSimilarity(a, b) {
+  if (!a || !b) return 0;
+  const A = bigrams(tokenize(a));
+  const B = bigrams(tokenize(b));
+  if (A.length === 0 || B.length === 0) return 0;
+  const map = new Map();
+  for (const g of A) map.set(g, (map.get(g) || 0) + 1);
+  let inter = 0;
+  for (const g of B) {
+    const n = map.get(g) || 0;
+    if (n > 0) { inter++; map.set(g, n - 1); }
+  }
+  return (2 * inter) / (A.length + B.length);
+}
+
+function bestFuzzyWindow(baseLines, targetLines, wiggle = 2) {
+  const tLen = targetLines.length;
+  const tStr = targetLines.join('\n');
+  let best = { score: -1, start: 0, end: 0, snippet: "" };
+
+  // exact search first (fast path)
+  const baseStr = baseLines.join('\n');
+  const idx = baseStr.indexOf(tStr);
+  if (idx !== -1) {
+    // Convert byte index to line range
+    const pre = baseStr.slice(0, idx);
+    const startLine = pre.split('\n').length - 1; // 0-indexed start
+    const endLine = startLine + tLen;             // exclusive
+    const snippet = baseLines.slice(startLine, endLine).join('\n');
+    return { score: 1.0, start: startLine, end: endLine, snippet };
+  }
+
+  const minW = Math.max(1, tLen - wiggle);
+  const maxW = Math.max(minW, tLen + wiggle);
+  for (let w = minW; w <= maxW; w++) {
+    for (let i = 0; i + w <= baseLines.length; i++) {
+      const cand = baseLines.slice(i, i + w).join('\n');
+      const s = diceSimilarity(cand, tStr);
+      if (s > best.score) best = { score: s, start: i, end: i + w, snippet: cand };
+    }
+  }
+  return best;
+}
+
+function padNewCodeToIndent(newCode, indent) {
+  const lines = normalizeNewlines(newCode).split('\n');
+  return lines.map(l => l.length ? indent + l : l).join('\n');
+}
+
+function commentOutBlock(lines, prefix, indent) {
+  return lines.map(l => indent + prefix + ' ' + l);
+}
+
+function makeXFilename(name) {
+  if (!name) return 'code.x.txt';
+  const i = name.lastIndexOf('.');
+  if (i <= 0) return name + '.x';
+  return name.slice(0, i) + '.x' + name.slice(i);
+}
+
+function downloadFile(name, text) {
+  const blob = new Blob([text], {type: 'text/plain;charset=utf-8'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    URL.revokeObjectURL(a.href);
+    a.remove();
+  }, 0);
+}
+
+/* ===== Wire up UI ===== */
+
+const $filename = byId('filename');
+const $commentStyle = byId('commentStyle');
+const $base = byId('base');
+const $target = byId('target');
+const $insertion = byId('insertion');
+const $threshold = byId('threshold');
+const $wiggle = byId('wiggle');
+const $findBtn = byId('findBtn');
+const $applyBtn = byId('applyBtn');
+const $downloadBtn = byId('downloadBtn');
+const $status = byId('status');
+const $preview = byId('preview');
+const $previewMeta = byId('previewMeta');
+
+let lastPatch = null; // { start,end, score, resultText }
+
+function findMatchOnly() {
+  const base = normalizeNewlines($base.value);
+  const target = normalizeNewlines($target.value);
+  const wiggle = Math.max(0, parseInt($wiggle.value || '2', 10));
+  const thr = Math.max(0, Math.min(1, parseFloat($threshold.value || '0.55')));
+
+  if (!base.trim() || !target.trim()) {
+    $status.innerHTML = 'Please paste base code and a target snippet.';
+    return null;
+  }
+
+  const baseLines = base.split('\n');
+  const targetLines = target.split('\n');
+  const best = bestFuzzyWindow(baseLines, targetLines, wiggle);
+
+  const meta = `Best match: score=${best.score.toFixed(3)} at lines ${best.start+1}–${best.end} (len=${best.end-best.start})`;
+  $previewMeta.textContent = meta;
+  $status.innerHTML = best.score >= thr
+    ? `<strong>Match OK</strong> — above threshold ${thr}.`
+    : `<span style="color:var(--warn)">Match below threshold</span> — ${best.score.toFixed(3)} < ${thr}. You can still apply.`;
+
+  // Show the matched chunk
+  $preview.textContent = best.snippet || '(no snippet)';
+  return { base, baseLines, target, targetLines, best, thr };
+}
+
+function applyPatch() {
+  const ctx = findMatchOnly();
+  if (!ctx) return;
+
+  const { baseLines, best, thr } = ctx;
+  const insertion = normalizeNewlines($insertion.value);
+  if (!insertion.trim()) {
+    $status.innerHTML = 'Please paste the new code to insert.';
+    return;
+  }
+
+  const filename = $filename.value.trim();
+  const prefix = getCommentPrefix(filename, $commentStyle.value);
+
+  const firstLine = baseLines[best.start] || '';
+  const indent = leadingIndentOf(firstLine);
+
+  const stamp = new Date().toISOString().replace('T',' ').replace('Z','');
+  const beginNew = `${indent}${prefix} BEGIN_SURGEON_NEW ${stamp}`;
+  const endNew   = `${indent}${prefix} END_SURGEON_NEW`;
+  const beginOld = `${indent}${prefix} BEGIN_SURGEON_OLD (commented out)`;
+  const endOld   = `${indent}${prefix} END_SURGEON_OLD`;
+
+  const oldBlockLines = baseLines.slice(best.start, best.end);
+  const commentedOld  = commentOutBlock(oldBlockLines, prefix, indent).join('\n');
+  const newIndented   = padNewCodeToIndent(insertion, indent);
+
+  const replacement = [
+    beginNew,
+    newIndented,
+    endNew,
+    '',
+    beginOld,
+    commentedOld,
+    endOld
+  ].join('\n');
+
+  const resultLines = [
+    ...baseLines.slice(0, best.start),
+    replacement,
+    ...baseLines.slice(best.end)
+  ];
+  const resultText = resultLines.join('\n');
+
+  lastPatch = { start: best.start, end: best.end, score: best.score, resultText };
+
+  $previewMeta.textContent = `Patched: lines ${best.start+1}–${best.end} (score=${best.score.toFixed(3)}).`;
+  $preview.textContent = resultText;
+  $status.innerHTML = (best.score >= thr)
+    ? `<strong>Patched</strong> — ready to download.`
+    : `<span style="color:var(--warn)">Patched (below threshold)</span> — review preview before download.`;
+}
+
+function downloadPatched() {
+  if (!lastPatch || !lastPatch.resultText) {
+    // if user never applied, try applying once
+    applyPatch();
+    if (!lastPatch) return;
+  }
+  const name = makeXFilename($filename.value.trim() || 'code.txt');
+  downloadFile(name, lastPatch.resultText);
+  $status.innerHTML = `<strong>Saved</strong> → ${name}`;
+}
+
+$findBtn.addEventListener('click', findMatchOnly);
+$applyBtn.addEventListener('click', applyPatch);
+$downloadBtn.addEventListener('click', downloadPatched);
+
+/* Demo seeds (optional): remove if you like) */
+$filename.value = "example.py";
+$base.value = `def add(a, b):\n    return a + b\n\ndef greet(name):\n    msg = "Hello, " + name\n    print(msg)\n\n# some more code\nfor i in range(3):\n    greet(str(i))\n`;
+$target.value = `def greet(name):\n    msg = "Hello, " + name\n    print(msg)`;
+$insertion.value = `def greet(name: str) -> None:\n    msg = f"Hello, {name}"\n    print(msg.upper())`;
+</script>
+</body>
+</html>
